@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triton-kernels"
+version = "0.1.0"
+description = "Triton kernels and utilities from Kernelize AI"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Matthew Leone", email = "matt@kernelize.ai" }]
+maintainers = [{ name = "Kernelize AI" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "torch>=2.1",
+  "triton>=2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/kernelize-ai/triton-kernels"
+Repository = "https://github.com/kernelize-ai/triton-kernels"
+Issues = "https://github.com/kernelize-ai/triton-kernels/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["triton_kernels*"]
+
+[project.scripts]
+triton-kernels-cli = "triton_kernels.utils.__main__:main"
