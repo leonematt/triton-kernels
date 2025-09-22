@@ -12,9 +12,10 @@ def test_ptx_mapper():
     ptx_dir = "kernels"
     
     # Test cases: (kernel_name, values, expected_result_contains)
+    # Updated to match function signature order: IS_NEOX, DO_KEY_ROPE, BLOCK_SIZE_ROT
     test_cases = [
-        ("rotary_embedding_kernel", ["256", "False", "True"], "rotary_embedding_kernel_BLOCK_SIZE_ROT256_DO_KEY_ROPEFalse_IS_NEOXTrue"),
-        ("rotary_embedding_kernel", ["256", "True", "False"], "rotary_embedding_kernel_BLOCK_SIZE_ROT256_DO_KEY_ROPETrue_IS_NEOXFalse"),
+        ("rotary_embedding_kernel", ["False", "True", "256"], "rotary_embedding_kernel_IS_NEOXFalse_DO_KEY_ROPETrue_BLOCK_SIZE_ROT256"),
+        ("rotary_embedding_kernel", ["True", "False", "256"], "rotary_embedding_kernel_IS_NEOXTrue_DO_KEY_ROPEFalse_BLOCK_SIZE_ROT256"),
         ("add_vectors", ["256"], "add_vectors_BLOCK_SIZE256"),
         ("add_vectors", ["512"], "add_vectors_BLOCK_SIZE512"),
         ("add_vectors", ["1024"], "add_vectors_BLOCK_SIZE1024"),
@@ -72,10 +73,10 @@ def test_specific_case():
     mapper_script = "triton_kernels/utils/kernel_mapper.py"
     ptx_dir = "kernels"
     
-    print("\nTesting specific case: rotary_embedding_kernel 256 False True")
+    print("\nTesting specific case: rotary_embedding_kernel False True 256")
     print("-" * 60)
     
-    cmd = ["python3", mapper_script, ptx_dir, "rotary_embedding_kernel", "256", "False", "True"]
+    cmd = ["python3", mapper_script, ptx_dir, "rotary_embedding_kernel", "False", "True", "256"]
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -88,7 +89,7 @@ def test_specific_case():
             print(f"Errors: {result.stderr.strip()}")
             
         # Check if we got the expected result
-        expected = "rotary_embedding_kernel_BLOCK_SIZE_ROT256_DO_KEY_ROPEFalse_IS_NEOXTrue"
+        expected = "rotary_embedding_kernel_IS_NEOXFalse_DO_KEY_ROPETrue_BLOCK_SIZE_ROT256"
         if expected in result.stdout:
             print(f"✅ SUCCESS: Got expected result!")
         else:

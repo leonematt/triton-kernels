@@ -47,7 +47,7 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
   print(f"Compiling {len(variants)} variants of {kernel_name}")
 
   for i, constants in enumerate(variants):
-    const_str = "_".join(f"{k}{v}" for k, v in sorted(constants.items()))
+    const_str = "_".join(f"{k}{v}" for k, v in constants.items())
     variant_name = f"{kernel_name}_{const_str}"
 
     print(f"  [{i+1}/{len(variants)}] {variant_name}")
