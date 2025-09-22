@@ -8,8 +8,20 @@ import time
 import re
 import sys
 import importlib.util
-from typing import List, Dict, Any
-import os
+import shutil
+
+def clear_triton_cache():
+  """Clear the Triton cache directory to ensure fresh compilation."""
+  cache_dir = Path.home() / ".triton" / "cache"
+  
+  if cache_dir.exists():
+    try:
+      shutil.rmtree(cache_dir)
+      print(f"  Cleared Triton cache: {cache_dir}")
+    except Exception as e:
+      print(f"  Warning: Could not clear cache: {e}")
+  else:
+    print(f"  No cache directory found at: {cache_dir}")
 
 def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_kernels=True):
   """
@@ -46,7 +58,7 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
 
     try:
       compiled = kernel[constants]
-      time.sleep(0.3)  # Wait for cache
+      time.sleep(1)  # Wait for cache
 
       ptx_content = None
       original_mangled_name = "unknown"
@@ -314,7 +326,9 @@ def compile_directory(directory, output_dir="./ptx_output"):
   Returns:
     Dict with compilation summary
   """
-  
+
+  clear_triton_cache()
+
   print(f"Searching for Triton kernel files in: {directory}")
   
   try:
