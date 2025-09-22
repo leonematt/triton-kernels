@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Import the kernel mapper functions
 try:
-    from kernel_name_mapper import get_kernel_from_values, KernelNameMapper, analyze_kernel_call
+    from utils.kernel_name_mapper import get_kernel_from_values, KernelNameMapper, analyze_kernel_call
 except ImportError as e:
     print(f"Error importing kernel_name_mapper: {e}")
     print("Make sure kernel_name_mapper.py is in the same directory")
