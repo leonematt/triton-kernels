@@ -4,16 +4,23 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.jit
+@triton.jit  
 def add_vectors(x_ptr, y_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr, BLOCK_SIZE2: tl.constexpr):
     pid = tl.program_id(0)
-    # Use both block sizes in the computation
-    total_block_size = BLOCK_SIZE + BLOCK_SIZE2
-    offsets = pid * total_block_size + tl.arange(0, total_block_size)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    tl.store(out_ptr + offsets, x + y, mask=mask)
+
+    # Process BLOCK_SIZE elements
+    offsets1 = pid * (BLOCK_SIZE + BLOCK_SIZE2) + tl.arange(0, BLOCK_SIZE)
+    mask1 = offsets1 < n
+    x1 = tl.load(x_ptr + offsets1, mask=mask1)
+    y1 = tl.load(y_ptr + offsets1, mask=mask1)
+    tl.store(out_ptr + offsets1, x1 + y1, mask=mask1)
+
+    # Process BLOCK_SIZE2 elements
+    offsets2 = pid * (BLOCK_SIZE + BLOCK_SIZE2) + BLOCK_SIZE + tl.arange(0, BLOCK_SIZE2)
+    mask2 = offsets2 < n
+    x2 = tl.load(x_ptr + offsets2, mask=mask2)
+    y2 = tl.load(y_ptr + offsets2, mask=mask2)
+    tl.store(out_ptr + offsets2, x2 + y2, mask=mask2)
 
 # Define variants with both BLOCK_SIZE and BLOCK_SIZE2
 variants = [
