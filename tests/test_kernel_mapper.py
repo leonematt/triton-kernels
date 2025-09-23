@@ -8,8 +8,8 @@ def test_ptx_mapper():
     """Test the PTX kernel mapper with various inputs"""
     
     # Path to the mapper script
-    mapper_script = "triton_kernels/utils/kernel_mapper.py"
-    ptx_dir = "kernels"
+    mapper_script = "src/triton_kernels/utils/kernel_mapper.py"
+    ptx_dir = "ptx_triton_kernels"
     
     # Test cases: (kernel_name, values, expected_result_contains)
     # Updated to match function signature order: IS_NEOX, DO_KEY_ROPE, BLOCK_SIZE_ROT
@@ -70,8 +70,8 @@ def test_ptx_mapper():
 def test_specific_case():
     """Test the specific case you mentioned"""
     
-    mapper_script = "triton_kernels/utils/kernel_mapper.py"
-    ptx_dir = "kernels"
+    mapper_script = "src/triton_kernels/utils/kernel_mapper.py"
+    ptx_dir = "ptx_triton_kernels"
     
     print("\nTesting specific case: rotary_embedding_kernel False True 256")
     print("-" * 60)
@@ -100,14 +100,14 @@ def test_specific_case():
 
 if __name__ == "__main__":
     # Check if mapper script exists
-    mapper_path = Path("triton_kernels/utils/kernel_mapper.py")
+    mapper_path = Path("src/triton_kernels/utils/kernel_mapper.py")
     if not mapper_path.exists():
         print(f"Error: Mapper script not found at {mapper_path}")
         print("Make sure you're running from the correct directory")
         sys.exit(1)
     
     # Check if kernels directory exists
-    kernels_path = Path("kernels")
+    kernels_path = Path("ptx_triton_kernels")
     if not kernels_path.exists():
         print(f"Error: Kernels directory not found at {kernels_path}")
         print("Make sure the PTX files are in the 'kernels' directory")

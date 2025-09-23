@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # Add kernels directory to path
-kernels_dir = Path(__file__).parent.parent / "kernels"
+kernels_dir = Path(__file__).parent.parent / "ptx_triton_kernels"
 sys.path.insert(0, str(kernels_dir))
 
 def pytorch_rotary_embedding(query: torch.Tensor,
