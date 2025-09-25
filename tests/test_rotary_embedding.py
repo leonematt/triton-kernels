@@ -151,7 +151,7 @@ def test_triton_rope():
 
 if __name__ == "__main__":
   try:
-    from rotary_embedding import rotary_embedding_kernel
+    from triton_kernels.rotary_embedding import rotary_embedding_kernel
   except ImportError as e:
     print(f"Could not import rotary_embedding_kernel: {e}")
     print("Make sure rotary_embedding.py is in the kernels directory.")

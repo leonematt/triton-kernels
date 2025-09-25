@@ -95,17 +95,8 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
       if ptx_content and rename_kernels:
         new_mangled_name = variant_name
 
-        modified_ptx = re.sub(
-          rf'(\.visible\s+\.entry\s+){re.escape(original_mangled_name)}',
-          rf'\1{new_mangled_name}',
-          ptx_content
-        )
-
-        modified_ptx = re.sub(
-          rf'\b{re.escape(original_mangled_name)}\b',
-          new_mangled_name,
-          modified_ptx
-        )
+        # Simple string replacement - that's it!
+        modified_ptx = ptx_content.replace(original_mangled_name, new_mangled_name)
 
         ptx_content = modified_ptx
         final_mangled_name = new_mangled_name
@@ -114,38 +105,12 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
 
       ptx_file = output_path / f"{variant_name}.ptx"
       if ptx_content:
-        header = f"""// Triton kernel variant: {variant_name}
-// Original kernel: {kernel_name}
-// Constants: {constants}
-// Original mangled name: {original_mangled_name}
-// Final mangled name: {final_mangled_name}
-
-"""
         with open(ptx_file, 'w') as f:
-          f.write(header + ptx_content)
+          f.write(ptx_content)
         print(f"    Created {ptx_file.name} ({len(ptx_content)} bytes)")
       else:
-        with open(ptx_file, 'w') as f:
-          f.write(f"""// Triton kernel variant: {variant_name}
-// Original kernel: {kernel_name}
-// Constants: {constants}
-// Status: Compiled successfully but PTX not accessible in this Triton version
-// Note: Check ~/.triton/cache/ for actual PTX files
-
-// Placeholder PTX - replace with actual content
-.version 7.0
-.target sm_80
-.address_size 64
-
-.visible .entry {variant_name}(
-  .param .u64 .ptr .global .align 8 param_0
-)
-{{
-  // Actual implementation would be here
-  ret;
-}}
-""")
-        print(f"    Created placeholder {ptx_file.name}")
+        print(f"    Failed to extract PTX content for {variant_name}")
+        continue
 
       results.append({
         'variant': variant_name,
