@@ -29,94 +29,61 @@ def get_kernel_cache_info(kernel, constants):
     import hashlib
     
     cache_root = Path.home() / ".triton" / "cache"
-    print(f"    Cache root exists: {cache_root.exists()}")
-    
-    if cache_root.exists():
-      cache_dirs = [d.name for d in cache_root.iterdir() if d.is_dir()]
-      print(f"    Cache directories: {len(cache_dirs)} found")
-      if cache_dirs:
-        print(f"    Sample dirs: {cache_dirs[:3]}")
     
     compiled_kernel = kernel[constants]
-    print(f"    Compiled kernel type: {type(compiled_kernel)}")
     
     cache_key = None
     metadata_hash = None
     
     if hasattr(compiled_kernel, 'metadata') and hasattr(compiled_kernel.metadata, 'hash'):
       metadata_hash = compiled_kernel.metadata.hash
-      print(f"    Found metadata hash: {metadata_hash}")
       
       try:
         hash_bytes = bytes.fromhex(metadata_hash)
         cache_key = base64.b32encode(hash_bytes).decode('ascii').rstrip('=')
-        print(f"    Converted to cache key: {cache_key}")
       except Exception as e:
-        print(f"    Failed to convert hash to cache key: {e}")
-    else:
-      print(f"    No metadata.hash found")
-      print(f"    Compiled kernel attributes: {[attr for attr in dir(compiled_kernel) if not attr.startswith('_')]}")
+        pass
     
     if not cache_key:
       if hasattr(compiled_kernel, 'cache_key'):
         cache_key = compiled_kernel.cache_key
-        print(f"    Using compiled_kernel.cache_key: {cache_key}")
       elif hasattr(compiled_kernel, 'asm') and hasattr(compiled_kernel.asm, 'hash'):
         cache_key = compiled_kernel.asm.hash
-        print(f"    Using asm.hash: {cache_key}")
       elif hasattr(compiled_kernel, 'fn') and hasattr(compiled_kernel.fn, 'cache_key'):
         cache_key = compiled_kernel.fn.cache_key
-        print(f"    Using fn.cache_key: {cache_key}")
     
     if cache_key and cache_root.exists():
       cache_dir_path = cache_root / cache_key
-      print(f"    Looking for exact cache dir: {cache_dir_path}")
       if cache_dir_path.exists():
         ptx_files = list(cache_dir_path.glob("*.ptx"))
-        print(f"    Found {len(ptx_files)} PTX files in exact match")
         if ptx_files:
-          print(f"    Found exact cache directory: {cache_key}")
           return cache_dir_path, ptx_files[0], cache_key
       
-      print(f"    Trying partial matches...")
       for cache_dir in cache_root.iterdir():
         if cache_dir.is_dir() and (cache_key in cache_dir.name or cache_dir.name.startswith(cache_key[:20])):
           ptx_files = list(cache_dir.glob("*.ptx"))
-          print(f"    Checking {cache_dir.name}: {len(ptx_files)} PTX files")
           if ptx_files:
-            print(f"    Found partial match cache directory: {cache_dir.name}")
             return cache_dir, ptx_files[0], cache_dir.name
     
-    print(f"    Falling back to recent directory search...")
     if cache_root.exists():
       recent_dirs = sorted([d for d in cache_root.iterdir() if d.is_dir()], 
                          key=lambda x: x.stat().st_mtime, reverse=True)
       
       kernel_name = kernel.fn.__name__
-      print(f"    Checking {len(recent_dirs)} recent directories for kernel '{kernel_name}'")
       for cache_dir in recent_dirs[:3]:
         ptx_files = list(cache_dir.glob("*.ptx"))
-        print(f"    Dir {cache_dir.name}: {len(ptx_files)} PTX files")
         if ptx_files:
           try:
             with open(ptx_files[0], 'r') as f:
               content = f.read()
               if kernel_name in content:
-                print(f"    Found by recent + content match: {cache_dir.name}")
                 return cache_dir, ptx_files[0], cache_dir.name
-              else:
-                print(f"    PTX content doesn't contain '{kernel_name}'")
           except Exception as e:
-            print(f"    Error reading PTX: {e}")
             continue
     
-    print(f"    No cache info found")
     return None, None, None
     
   except Exception as e:
-    print(f"    Warning: Could not get cache info: {e}")
-    import traceback
-    traceback.print_exc()
     return None, None, None
 
 def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_kernels=True):
@@ -129,10 +96,38 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
 
   print(f"Compiling {len(variants)} variants of {kernel_name}")
 
-  size = 1024
-  x = torch.randn(size, device='cuda')
-  y = torch.randn(size, device='cuda')
-  output = torch.empty_like(x)
+  # Detect kernel type by inspecting variant keys
+  if variants:
+    sample_variant = variants[0]
+    has_matmul_keys = all(k in sample_variant for k in ['BLOCK_SIZE_M', 'BLOCK_SIZE_N', 'BLOCK_SIZE_K'])
+    has_elementwise_keys = 'BLOCK_SIZE' in sample_variant and not has_matmul_keys
+    
+    if has_matmul_keys:
+      kernel_type = 'matmul'
+      print(f"  Detected kernel type: matmul")
+    elif has_elementwise_keys:
+      kernel_type = 'elementwise'
+      print(f"  Detected kernel type: elementwise")
+    else:
+      print(f"  Warning: Could not detect kernel type")
+      kernel_type = 'unknown'
+  else:
+    kernel_type = 'unknown'
+
+  # Prepare test data based on kernel type
+  if kernel_type == 'matmul':
+    M, N, K = 512, 512, 512
+    a = torch.randn((M, K), device='cuda', dtype=torch.float32)
+    b = torch.randn((K, N), device='cuda', dtype=torch.float32)
+    output = torch.empty((M, N), device='cuda', dtype=torch.float32)
+  elif kernel_type == 'elementwise':
+    size = 1024
+    x = torch.randn(size, device='cuda', dtype=torch.float32)
+    y = torch.randn(size, device='cuda', dtype=torch.float32)
+    output = torch.empty_like(x)
+  else:
+    print(f"  Skipping unknown kernel type")
+    return []
 
   for i, constants in enumerate(variants):
     const_str = "_".join(f"{k}{v}" for k, v in constants.items())
@@ -141,15 +136,25 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
     print(f"  [{i+1}/{len(variants)}] {variant_name}")
 
     try:
-      # First, run the kernel to force compilation and cache creation
-      grid = (triton.cdiv(size, constants.get('BLOCK_SIZE', 256)),)
-      kernel[grid](x, y, output, size, **constants)
+      # Run kernel based on type
+      if kernel_type == 'matmul':
+        BLOCK_M = constants['BLOCK_SIZE_M']
+        BLOCK_N = constants['BLOCK_SIZE_N']
+        grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+        kernel[grid](
+          a, b, output, M, N, K,
+          a.stride(0), a.stride(1),
+          b.stride(0), b.stride(1),
+          output.stride(0), output.stride(1),
+          **constants
+        )
+      else:  # elementwise
+        grid = (triton.cdiv(size, constants.get('BLOCK_SIZE', 256)),)
+        kernel[grid](x, y, output, size, **constants)
       
       time.sleep(0.1)
       
-      # Now get the compiled kernel object after execution
       compiled = kernel[constants]
-      
       cache_dir, ptx_file_path, cache_key = get_kernel_cache_info(kernel, constants)
       
       if not ptx_file_path or not ptx_file_path.exists():
@@ -174,11 +179,9 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
       final_mangled_name = original_mangled_name
       if rename_kernels:
         new_mangled_name = variant_name
-
         modified_ptx = ptx_content.replace(original_mangled_name, new_mangled_name)
         ptx_content = modified_ptx
         final_mangled_name = new_mangled_name
-
         print(f"    Renamed: {original_mangled_name} -> {new_mangled_name}")
 
       output_ptx_file = output_path / f"{variant_name}.ptx"
@@ -189,7 +192,6 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
 
       if cache_dir and cache_dir.exists():
         try:
-          import shutil
           shutil.rmtree(cache_dir)
           print(f"    Removed cache entry: {cache_key}")
         except Exception as e:
@@ -209,8 +211,6 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
 
     except Exception as e:
       print(f"    Failed: {e}")
-      import traceback
-      traceback.print_exc()
 
   print(f"Compiled {len(results)} variants")
   return results
@@ -243,10 +243,8 @@ def load_kernel_module(file_path):
 
     if hasattr(obj, '__call__') and hasattr(obj, 'fn'):
       kernels[name] = obj
-
     elif name == 'variants' and isinstance(obj, list):
       variants = obj
-
     elif name == 'run' and callable(obj):
       run_func = obj
 
@@ -370,10 +368,10 @@ def compile_directory(directory, output_dir="./ptx_output"):
 def main():
 
   if len(sys.argv) != 2:
-    print("Usage: python triton_compiler.py <directory>")
+    print("Usage: python generate_kernel_binaries.py <directory>")
     print("\nExample:")
-    print("  python triton_compiler.py ./kernels/")
-    print("  python triton_compiler.py /path/to/triton/kernels/")
+    print("  python generate_kernel_binaries.py ./kernels/")
+    print("  python generate_kernel_binaries.py /path/to/triton/kernels/")
     print("\nThe script will recursively search for Python files containing:")
     print("  - @triton.jit decorated functions")
     print("  - A 'variants' list with parameter combinations")
