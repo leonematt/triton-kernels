@@ -1,164 +1,195 @@
-#!/usr/bin/env python3
-
+import pytest
 import torch
+import nexus
 import os
-import sys
-from pathlib import Path
 
-# Add kernels directory to path
-kernels_dir = Path(__file__).parent.parent / "ptx_triton_kernels"
-sys.path.insert(0, str(kernels_dir))
+# Test variants matching your rotary_embedding.py variants
+VARIANTS = [
+    {'BATCH': 2, 'SEQLEN': 128, 'NHEADS': 4, 'HEADDIM': 64, 'ROTARY_DIM': 64, 'INTERLEAVED': False, 'INPLACE': False},
+    {'BATCH': 2, 'SEQLEN': 256, 'NHEADS': 8, 'HEADDIM': 64, 'ROTARY_DIM': 64, 'INTERLEAVED': False, 'INPLACE': False},
+    {'BATCH': 4, 'SEQLEN': 512, 'NHEADS': 8, 'HEADDIM': 128, 'ROTARY_DIM': 128, 'INTERLEAVED': False, 'INPLACE': False},
+    {'BATCH': 2, 'SEQLEN': 128, 'NHEADS': 4, 'HEADDIM': 64, 'ROTARY_DIM': 64, 'INTERLEAVED': True, 'INPLACE': False},
+    {'BATCH': 1, 'SEQLEN': 1024, 'NHEADS': 16, 'HEADDIM': 64, 'ROTARY_DIM': 32, 'INTERLEAVED': False, 'INPLACE': False},
+    {'BATCH': 2, 'SEQLEN': 128, 'NHEADS': 4, 'HEADDIM': 64, 'ROTARY_DIM': 64, 'INTERLEAVED': False, 'INPLACE': True},
+]
 
-def pytorch_rotary_embedding(query: torch.Tensor,
-                             key: torch.Tensor,
-                             positions: torch.Tensor,
-                             head_size: int,
-                             is_neox: bool,
-                             base: float = 10000.0):
-  seq_len = positions.shape[0]
-  rotary_dim = head_size
-  device = query.device
-  
-  inv_freq = 1.0 / (base**(
-    torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim
-  ))
-  t = positions.float()
-  freqs = torch.outer(t, inv_freq)
-  cos = torch.cos(freqs)
-  sin = torch.sin(freqs)
-  
-  def apply_rope(tensor, cos, sin):
-    reshaped_tensor = tensor.reshape(seq_len, -1, head_size)
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
 
-    if is_neox:
-      p1, p2 = torch.chunk(reshaped_tensor, 2, dim=-1)
-      rotated = torch.cat([p1 * cos - p2 * sin, p2 * cos + p1 * sin], dim=-1)
+@pytest.fixture(scope="module")
+def runtime_and_device():
+    """Setup runtime and device once for all tests"""
+    rt = nexus.get_runtime("cuda")
+    dev = rt.get_devices()[0]
+    return rt, dev
+
+
+def compute_rotary_cos_sin(seqlen, rotary_dim, base=10000.0):
+    """Compute cos and sin for rotary embeddings"""
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+    t = torch.arange(seqlen, dtype=inv_freq.dtype)
+    freqs = torch.outer(t, inv_freq)
+    cos = freqs.cos()
+    sin = freqs.sin()
+    return cos, sin
+
+
+def naive_rotary_embedding(x, cos, sin, interleaved=False):
+    """Reference PyTorch implementation for verification"""
+    batch, seqlen, nheads, headdim = x.shape
+    rotary_dim = cos.shape[1] * 2
+    
+    x_rot = x[..., :rotary_dim].clone()
+    x_pass = x[..., rotary_dim:].clone()
+    
+    cos = cos[:seqlen, :].unsqueeze(0).unsqueeze(2)
+    sin = sin[:seqlen, :].unsqueeze(0).unsqueeze(2)
+    
+    if not interleaved:
+        x1 = x_rot[..., :rotary_dim//2]
+        x2 = x_rot[..., rotary_dim//2:rotary_dim]
+        
+        o1 = x1 * cos - x2 * sin
+        o2 = x1 * sin + x2 * cos
+        
+        output_rot = torch.cat([o1, o2], dim=-1)
     else:
-      reshaped_pairs = reshaped_tensor.reshape(*reshaped_tensor.shape[:-1], -1, 2)
-      p1 = reshaped_pairs[..., 0]
-      p2 = reshaped_pairs[..., 1]
-      
-      rotated_pairs = torch.empty_like(reshaped_pairs)
-      rotated_pairs[..., 0] = p1 * cos - p2 * sin
-      rotated_pairs[..., 1] = p2 * cos + p1 * sin
-      rotated = rotated_pairs.flatten(start_dim=-2)
-      
-    return rotated.reshape_as(tensor)
+        x1 = x_rot[..., 0::2]
+        x2 = x_rot[..., 1::2]
+        
+        o1 = x1 * cos - x2 * sin
+        o2 = x1 * sin + x2 * cos
+        
+        output_rot = torch.empty_like(x_rot)
+        output_rot[..., 0::2] = o1
+        output_rot[..., 1::2] = o2
+    
+    if rotary_dim < headdim:
+        return torch.cat([output_rot, x_pass], dim=-1)
+    return output_rot
 
-  q_out = apply_rope(query, cos, sin)
-  k_out = apply_rope(key, cos, sin)
-  return q_out, k_out
 
-def test_triton_rope():
-  seq_len = 128
-  num_heads = 32
-  num_kv_heads = 8
-  head_size = 128
-  rotary_dim = head_size
-  hidden_size = num_heads * head_size
-  max_pos = 2048
-  base = 10000.0
-  dtype = torch.float16
-  
-  positions = torch.arange(seq_len, dtype=torch.long, device="cuda")
-  query = torch.randn(seq_len, hidden_size, dtype=dtype, device="cuda")
-  key = torch.randn(seq_len, num_kv_heads * head_size, dtype=dtype, device="cuda")
-  
-  # Create cos/sin cache
-  inv_freq = 1.0 / (base ** (
-    torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cuda") / rotary_dim
-  ))
-  t = torch.arange(max_pos, dtype=torch.float32, device="cuda")
-  freqs = torch.outer(t, inv_freq)
-  cos_sin_cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1).to(dtype)
-  
-  for is_neox_style in [True, False]:
-    for do_key_rope in [True, False]:
-      print("=" * 60)
-      print(f"RoPE Comparison: IS_NEOX = {is_neox_style}, DO_KEY_ROPE = {do_key_rope}")
-      print("=" * 60)
-      print(f"Shape: Query({seq_len}, {hidden_size}), Key({seq_len}, {num_kv_heads * head_size})")
-      print(f"Num heads: {num_heads}, Head size: {head_size}")
-      print(f"Dtype: {dtype}\n")
-      
-      # 1. PyTorch reference
-      print(f"1. PyTorch Reference:")
-      q_out_ref, k_out_ref = pytorch_rotary_embedding(
-        query.clone(), key.clone(), positions, rotary_dim, is_neox_style, base
-      )
-      print(f"   Query output mean: {q_out_ref.mean().item():.6f}")
-      print(f"   Key output mean: {k_out_ref.mean().item():.6f}")
-      
-      # 2. Triton JIT kernel
-      print(f"\n2. Triton JIT Kernel:")
-      
-      # Reshape for kernel (seq_len, num_heads, head_size)
-      q_test = query.clone().view(seq_len, num_heads, head_size)
-      k_test = key.clone().view(seq_len, num_kv_heads, head_size)
-      
-      # Calculate strides
-      query_stride_token = q_test.stride(0)
-      key_stride_token = k_test.stride(0)
-      head_stride = q_test.stride(1)
-      
-      try:
-        # Launch Triton kernel
-        grid = (seq_len,)
-        rotary_embedding_kernel[grid](
-          positions, q_test, k_test, cos_sin_cache,
-          query_stride_token, key_stride_token, head_stride,
-          num_heads, num_kv_heads, head_size, rotary_dim,
-          IS_NEOX=is_neox_style,
-          DO_KEY_ROPE=do_key_rope,
-          BLOCK_SIZE_ROT=256
-        )
-        
-        # Reshape back for comparison
-        output_q_triton = q_test.view(seq_len, hidden_size)
-        output_k_triton = k_test.view(seq_len, -1) if do_key_rope else k_out_ref
-        
-        print(f"   Query output mean: {output_q_triton.mean().item():.6f}")
-        print(f"   Key output mean: {output_k_triton.mean().item():.6f}")
-        
-        # Compare with appropriate tolerances
-        diff_q = torch.abs(output_q_triton - q_out_ref)
-        diff_k = torch.abs(output_k_triton - k_out_ref) if do_key_rope else torch.tensor(0.0)
-        max_diff_q = diff_q.max().item()
-        max_diff_k = diff_k.max().item() if do_key_rope else 0.0
-        
-        print(f"\n   Comparison:")
-        print(f"   Query max difference: {max_diff_q:.2e}")
-        if do_key_rope:
-          print(f"   Key max difference: {max_diff_k:.2e}")
-        else:
-          print(f"   Key difference: N/A (DO_KEY_ROPE=False)")
-        
-        tolerance = 0.05
-        print(f"   Tolerance: {tolerance}")
-        
-        max_diff = max(max_diff_q, max_diff_k) if do_key_rope else max_diff_q
-        if max_diff < tolerance:
-          print(f"   ✅ PASSED (within tolerance)")
-        else:
-          print(f"   ❌ FAILED (exceeds tolerance)")
-        
-      except Exception as e:
-        print(f"   ❌ FAILED: {e}")
-      
-      print("\n" + "=" * 60 + "\n")
+@pytest.mark.parametrize("variant", VARIANTS, ids=lambda v: f"b{v['BATCH']}_s{v['SEQLEN']}_h{v['NHEADS']}_d{v['HEADDIM']}_r{v['ROTARY_DIM']}_i{v['INTERLEAVED']}_ip{v['INPLACE']}")
+def test_rotary_embedding(runtime_and_device, variant):
+    """Test rotary embedding kernel with different configurations"""
+    rt, dev = runtime_and_device
+    
+    batch = variant['BATCH']
+    seqlen = variant['SEQLEN']
+    nheads = variant['NHEADS']
+    headdim = variant['HEADDIM']
+    rotary_dim = variant['ROTARY_DIM']
+    interleaved = variant['INTERLEAVED']
+    inplace = variant['INPLACE']
+    
+    # Create test data
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.float32)
+    x_original = x.clone()
+    
+    # Compute cos/sin
+    cos, sin = compute_rotary_cos_sin(seqlen, rotary_dim)
+    
+    # Prepare output
+    if inplace:
+        output = x.clone()
+    else:
+        output = torch.empty_like(x)
+        if rotary_dim < headdim:
+            output[..., rotary_dim:] = x[..., rotary_dim:]
+    
+    # Ensure contiguous
+    x = x.contiguous()
+    output = output.contiguous()
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    
+    # Create device buffers
+    nb_out = dev.create_buffer(output)
+    nb_x = dev.create_buffer(x)
+    nb_cos = dev.create_buffer(cos)
+    nb_sin = dev.create_buffer(sin)
+    
+    # Create dummy buffer
+    dummy = torch.zeros(1, dtype=torch.float32)
+    nb_dummy = dev.create_buffer(dummy)
+    
+    # Load kernel
+    kernel_name = f'rotary_embedding_kernel_BATCH{batch}_SEQLEN{seqlen}_NHEADS{nheads}_HEADDIM{headdim}_ROTARY_DIM{rotary_dim}_INTERLEAVED{interleaved}_INPLACE{inplace}'
+    lib_path = f"ptx_kernels/{kernel_name}.ptx"
+    
+    if not os.path.exists(lib_path):
+        pytest.skip(f"Kernel file not found: {lib_path}")
+    
+    try:
+        lib = dev.load_library_file(lib_path)
+        kern = lib.get_kernel(kernel_name)
+    except Exception as e:
+        pytest.fail(f"Failed to load kernel {kernel_name}: {e}")
+    
+    # Determine block sizes
+    BLOCK_K = 32 if rotary_dim <= 32 else (64 if rotary_dim <= 64 else (128 if rotary_dim <= 128 else 256))
+    BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
+    
+    # Calculate grid dimensions
+    grid_m = (seqlen + BLOCK_M - 1) // BLOCK_M
+    grid = [grid_m, nheads, batch]
+    block = [64, 1, 1]
+    
+    print(f"\nTesting rotary embedding:")
+    print(f"  Config: batch={batch}, seqlen={seqlen}, nheads={nheads}, headdim={headdim}")
+    print(f"  Rotary: rotary_dim={rotary_dim}, interleaved={interleaved}, inplace={inplace}")
+    print(f"  Grid: {grid}, Block: {block}")
+    
+    # Create and configure command
+    sched = dev.create_schedule()
+    cmd = sched.create_command(kern)
+    
+    # Set arguments - PTX has 15 params (0-14) but Triton optimizes away 2 strides
+    # Try passing all 17 to match what Triton does
+    cmd.set_arg(0, nb_out)                    # OUT pointer
+    cmd.set_arg(1, nb_x)                      # X pointer
+    cmd.set_arg(2, nb_cos)                    # COS pointer
+    cmd.set_arg(3, nb_sin)                    # SIN pointer
+    cmd.set_arg(4, 0)                         # seqlen_offsets (u32)
+    cmd.set_arg(5, seqlen)                    # seqlen (u32)
+    cmd.set_arg(6, rotary_dim)                # rotary_dim (u32)
+    cmd.set_arg(7, seqlen)                    # seqlen_ro (u32)
+    cmd.set_arg(8, output.stride(0))          # stride_out_batch
+    cmd.set_arg(9, output.stride(1))          # stride_out_seqlen
+    cmd.set_arg(10, output.stride(2))         # stride_out_nheads
+    cmd.set_arg(11, output.stride(3))         # stride_out_headdim
+    cmd.set_arg(12, x.stride(0))              # stride_x_batch
+    cmd.set_arg(13, x.stride(1))              # stride_x_seqlen
+    cmd.set_arg(14, x.stride(2))              # stride_x_nheads (optimized away in PTX)
+    cmd.set_arg(15, x.stride(3))              # stride_x_headdim (optimized away in PTX)
+    cmd.set_arg(16, nb_dummy)                 # dummy pointer
+    
+    cmd.finalize(grid, block)
+    
+    # Run kernel
+    sched.run()
+    
+    # Copy result back
+    nb_out.copy(output)
+    
+    # Compute expected result
+    expected = naive_rotary_embedding(x_original, cos, sin, interleaved=interleaved)
+    
+    # Verify results
+    print(f"  Output shape: {output.shape}")
+    print(f"  Output sample: {output[0, 0, 0, :5].tolist()}")
+    print(f"  Expected sample: {expected[0, 0, 0, :5].tolist()}")
+    
+    # Check rotary dimensions
+    if not torch.allclose(output[..., :rotary_dim], expected[..., :rotary_dim], rtol=1e-4, atol=1e-4):
+        max_diff = (output[..., :rotary_dim] - expected[..., :rotary_dim]).abs().max().item()
+        pytest.fail(f"Rotary dimensions mismatch. Max diff: {max_diff}")
+    
+    # Check non-rotary dimensions (if applicable)
+    if rotary_dim < headdim:
+        assert torch.allclose(output[..., rotary_dim:], expected[..., rotary_dim:], rtol=1e-5, atol=1e-5), \
+            "Non-rotary dimensions should be unchanged"
+    
+    print("  ✓ Test passed")
+
 
 if __name__ == "__main__":
-  try:
-    from triton_kernels.rotary_embedding import rotary_embedding_kernel
-  except ImportError as e:
-    print(f"Could not import rotary_embedding_kernel: {e}")
-    print("Make sure rotary_embedding.py is in the kernels directory.")
-    sys.exit(1)
-  
-  if not torch.cuda.is_available():
-    print("This test requires a CUDA-enabled GPU.")
-    sys.exit(1)
-
-  test_triton_rope()
+    pytest.main([__file__, "-v", "-s"])

@@ -96,11 +96,16 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
 
   print(f"Compiling {len(variants)} variants of {kernel_name}")
 
-  # Detect kernel type by inspecting variant keys
+  # Detect kernel type by inspecting variant keys (support both upper and lowercase)
   if variants:
     sample_variant = variants[0]
     has_matmul_keys = all(k in sample_variant for k in ['BLOCK_SIZE_M', 'BLOCK_SIZE_N', 'BLOCK_SIZE_K'])
     has_elementwise_keys = 'BLOCK_SIZE' in sample_variant and not has_matmul_keys
+    has_rotary_keys = all(k in sample_variant for k in ['BATCH', 'SEQLEN', 'NHEADS', 'HEADDIM', 'ROTARY_DIM'])
+    
+    # Also check lowercase for backward compatibility
+    if not has_rotary_keys:
+      has_rotary_keys = all(k in sample_variant for k in ['batch', 'seqlen', 'nheads', 'headdim', 'rotary_dim'])
     
     if has_matmul_keys:
       kernel_type = 'matmul'
@@ -108,6 +113,9 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
     elif has_elementwise_keys:
       kernel_type = 'elementwise'
       print(f"  Detected kernel type: elementwise")
+    elif has_rotary_keys:
+      kernel_type = 'rotary'
+      print(f"  Detected kernel type: rotary")
     else:
       print(f"  Warning: Could not detect kernel type")
       kernel_type = 'unknown'
@@ -125,6 +133,9 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
     x = torch.randn(size, device='cuda', dtype=torch.float32)
     y = torch.randn(size, device='cuda', dtype=torch.float32)
     output = torch.empty_like(x)
+  elif kernel_type == 'rotary':
+    # We'll handle this per-variant since dimensions vary
+    pass
   else:
     print(f"  Skipping unknown kernel type")
     return []
@@ -148,9 +159,57 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
           output.stride(0), output.stride(1),
           **constants
         )
-      else:  # elementwise
+      elif kernel_type == 'elementwise':
         grid = (triton.cdiv(size, constants.get('BLOCK_SIZE', 256)),)
         kernel[grid](x, y, output, size, **constants)
+      elif kernel_type == 'rotary':
+        # Extract dimensions from variant (support both upper and lowercase)
+        batch = constants.get('BATCH') or constants.get('batch')
+        seqlen = constants.get('SEQLEN') or constants.get('seqlen')
+        nheads = constants.get('NHEADS') or constants.get('nheads')
+        headdim = constants.get('HEADDIM') or constants.get('headdim')
+        rotary_dim = constants.get('ROTARY_DIM') or constants.get('rotary_dim')
+        interleaved = constants.get('INTERLEAVED', constants.get('interleaved', False))
+        inplace = constants.get('INPLACE', constants.get('inplace', False))
+        
+        # Create test data
+        x = torch.randn(batch, seqlen, nheads, headdim, device='cuda', dtype=torch.float32)
+        
+        # Compute cos/sin
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2, device='cuda').float() / rotary_dim))
+        t = torch.arange(seqlen, device='cuda', dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
+        cos = freqs.cos().contiguous()
+        sin = freqs.sin().contiguous()
+        
+        output = x if inplace else torch.empty_like(x)
+        if rotary_dim < headdim and not inplace:
+          output[..., rotary_dim:].copy_(x[..., rotary_dim:])
+        
+        # Determine block sizes
+        BLOCK_K = (32 if rotary_dim <= 32 else 
+                  (64 if rotary_dim <= 64 else 
+                  (128 if rotary_dim <= 128 else 256)))
+        BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
+        
+        grid = (triton.cdiv(seqlen, BLOCK_M), nheads, batch)
+        
+        with torch.cuda.device(x.device.index):
+          kernel[grid](
+            output, x, cos, sin,
+            None,  # CU_SEQLENS
+            0,     # seqlen_offsets
+            seqlen, rotary_dim, seqlen,
+            output.stride(0), output.stride(-3), output.stride(-2), output.stride(-1),
+            x.stride(0), x.stride(-3), x.stride(-2), x.stride(-1),  # Pass all 4 strides
+            BLOCK_K=BLOCK_K,
+            IS_SEQLEN_OFFSETS_TENSOR=False,
+            IS_VARLEN=False,
+            INTERLEAVED=interleaved,
+            CONJUGATE=False,
+            BLOCK_M=BLOCK_M,
+            num_warps=2 if rotary_dim <= 64 else 4,
+          )
       
       time.sleep(0.1)
       
@@ -211,6 +270,8 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
 
     except Exception as e:
       print(f"    Failed: {e}")
+      import traceback
+      traceback.print_exc()
 
   print(f"Compiled {len(results)} variants")
   return results

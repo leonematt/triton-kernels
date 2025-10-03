@@ -56,12 +56,12 @@ def rms_norm_kernel(
 
 # Test variants with different block sizes and configurations
 variants = [
-    {'BLOCK_SIZE': 1024, 'eps': 1e-6},
-    {'BLOCK_SIZE': 2048, 'eps': 1e-6},
-    {'BLOCK_SIZE': 4096, 'eps': 1e-6},
-    {'BLOCK_SIZE': 8192, 'eps': 1e-6},
-    {'BLOCK_SIZE': 1024, 'eps': 1e-5},
-    {'BLOCK_SIZE': 2048, 'eps': 1e-5},
+    {'BLOCK_SIZE': 1024, 'EPS': 1e-6},
+    {'BLOCK_SIZE': 2048, 'EPS': 1e-6},
+    {'BLOCK_SIZE': 4096, 'EPS': 1e-6},
+    {'BLOCK_SIZE': 8192, 'EPS': 1e-6},
+    {'BLOCK_SIZE': 1024, 'EPS': 1e-5},
+    {'BLOCK_SIZE': 2048, 'EPS': 1e-5},
 ]
 
 def run():
@@ -74,7 +74,7 @@ def run():
 
     for variant in variants:
         block_size = variant['BLOCK_SIZE']
-        eps = variant['eps']
+        eps = variant['EPS']
         
         print(f"Testing BLOCK_SIZE={block_size:4}, eps={eps:.0e}... ", end="")
 
