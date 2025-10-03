@@ -102,6 +102,7 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
     has_matmul_keys = all(k in sample_variant for k in ['BLOCK_SIZE_M', 'BLOCK_SIZE_N', 'BLOCK_SIZE_K'])
     has_elementwise_keys = 'BLOCK_SIZE' in sample_variant and not has_matmul_keys
     has_rotary_keys = all(k in sample_variant for k in ['BATCH', 'SEQLEN', 'NHEADS', 'HEADDIM', 'ROTARY_DIM'])
+    has_softmax_keys = 'BLOCK_SIZE' in sample_variant and kernel_name.lower().find('softmax') != -1
     
     # Also check lowercase for backward compatibility
     if not has_rotary_keys:
@@ -110,6 +111,9 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
     if has_matmul_keys:
       kernel_type = 'matmul'
       print(f"  Detected kernel type: matmul")
+    elif has_softmax_keys:
+      kernel_type = 'softmax'
+      print(f"  Detected kernel type: softmax")
     elif has_elementwise_keys:
       kernel_type = 'elementwise'
       print(f"  Detected kernel type: elementwise")
@@ -128,6 +132,11 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
     a = torch.randn((M, K), device='cuda', dtype=torch.float32)
     b = torch.randn((K, N), device='cuda', dtype=torch.float32)
     output = torch.empty((M, N), device='cuda', dtype=torch.float32)
+  elif kernel_type == 'softmax':
+    n_rows = 128
+    n_cols = 256
+    input_tensor = torch.randn(n_rows, n_cols, device='cuda', dtype=torch.float32)
+    output = torch.empty_like(input_tensor)
   elif kernel_type == 'elementwise':
     size = 1024
     x = torch.randn(size, device='cuda', dtype=torch.float32)
@@ -157,6 +166,17 @@ def compile_triton_variants(kernel, variants, output_dir="./ptx_output", rename_
           a.stride(0), a.stride(1),
           b.stride(0), b.stride(1),
           output.stride(0), output.stride(1),
+          **constants
+        )
+      elif kernel_type == 'softmax':
+        grid = (n_rows,)
+        kernel[grid](
+          input_tensor,
+          output,
+          n_rows,
+          n_cols,
+          input_tensor.stride(0),
+          output.stride(0),
           **constants
         )
       elif kernel_type == 'elementwise':
