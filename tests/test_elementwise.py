@@ -23,7 +23,7 @@ def runtime_and_device():
     return rt, dev
 
 
-@pytest.mark.parametrize("variant", VARIANTS, ids=lambda v: f"BLOCK_SIZE{v['BLOCK_SIZE']}")
+@pytest.mark.parametrize("variant", VARIANTS, ids=lambda v: f"BLOCK_SIZE_{v['BLOCK_SIZE']}")
 @pytest.mark.parametrize("operation", OPERATIONS)
 def test_elementwise_operation(runtime_and_device, variant, operation):
     """Test elementwise operations with different block sizes"""
@@ -31,7 +31,7 @@ def test_elementwise_operation(runtime_and_device, variant, operation):
     block_size = variant['BLOCK_SIZE']
     n_elements = 1024
     
-    # Create test data
+    # Create test data on CPU
     buf0 = torch.full((n_elements,), 3.0, dtype=torch.float32)
     buf1 = torch.ones(n_elements, dtype=torch.float32)
     res = torch.zeros(n_elements, dtype=torch.float32)
@@ -41,15 +41,15 @@ def test_elementwise_operation(runtime_and_device, variant, operation):
     nb1 = dev.create_buffer(buf1)
     nb_res = dev.create_buffer(res)
     
-    # Load kernel
-    kernel_name = f'elementwise_{operation}_kernel_BLOCK_SIZE{block_size}'
+    # The actual kernel name inside PTX matches the Triton function name
+    kernel_name = f'elementwise_{operation}_BLOCK_SIZE_{block_size}'
     lib_path = f"ptx_kernels/{kernel_name}.ptx"
     
     if not os.path.exists(lib_path):
         pytest.skip(f"Kernel file not found: {lib_path}")
     
     try:
-        lib = dev.load_library_file(lib_path)
+        lib = dev.load_library(lib_path)
         kern = lib.get_kernel(kernel_name)
     except Exception as e:
         pytest.fail(f"Failed to load kernel {kernel_name}: {e}")
@@ -62,23 +62,21 @@ def test_elementwise_operation(runtime_and_device, variant, operation):
     cmd.set_arg(1, nb1)          # b_ptr
     cmd.set_arg(2, nb_res)       # output_ptr
     cmd.set_arg(3, n_elements)   # n_elements
-    cmd.set_arg(4, n_elements)   # n_elements (second occurrence)
-    
-    # Match the original configuration:
-    # Use 128 threads per block, regardless of BLOCK_SIZE in kernel name
-    # Grid size = total elements / threads per block
-    threads_per_block = 128
-    grid_size = (n_elements + threads_per_block - 1) // threads_per_block
+    cmd.set_arg(4, 0)
+    # Calculate grid size based on block_size
+    grid_size = (n_elements + block_size - 1) // block_size
     
     print(f"\nTesting {operation} with kernel BLOCK_SIZE={block_size}")
-    print(f"Grid: [{grid_size}, 1, 1], Block: [{threads_per_block}, 1, 1]")
+    print(f"Grid: [{grid_size}, 1, 1], Block: [128, 1, 1]")
+    print(f"Kernel name: {kernel_name}")
+    print(f"Library path: {lib_path}")
     
-    cmd.finalize([grid_size, 1, 1], [threads_per_block, 1, 1])
+    cmd.finalize([grid_size, 1, 1], [128, 1, 1])
     
-    # Run kernel
+    # Run kernel and synchronize
     sched.run()
     
-    # Copy result back
+    # Copy result back to CPU
     nb_res.copy(res)
     
     # Verify results based on operation

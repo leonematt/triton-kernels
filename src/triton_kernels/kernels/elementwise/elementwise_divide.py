@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def elementwise_divide_kernel(
+def elementwise_divide(
     a_ptr,          # Pointer to first input tensor
     b_ptr,          # Pointer to second input tensor  
     output_ptr,     # Pointer to output tensor
@@ -37,51 +37,10 @@ def elementwise_divide_kernel(
     # Store the result back to global memory
     tl.store(output_ptr + offsets, output, mask=mask)
 
-# Test variants with different block sizes
-variants = [
+# Variants with different block sizes
+VARIANTS = [
     {'BLOCK_SIZE': 128},
     {'BLOCK_SIZE': 256},
     {'BLOCK_SIZE': 512},
     {'BLOCK_SIZE': 1024},
 ]
-    
-def run():
-    tensor_size = 4096
-    
-    print(f"--- Running Division Kernel Variants (Tensor Size: {tensor_size}) ---")
-
-    # Loop through and test each variant
-    for variant in variants:
-        block_size = variant['BLOCK_SIZE']
-
-        print(f"Testing BLOCK_SIZE={block_size:4}... ", end="")
-
-        try:
-            # Data and Kernel Execution
-            a = torch.randn(tensor_size, device='cuda', dtype=torch.float32)
-            b = torch.randn(tensor_size, device='cuda', dtype=torch.float32)
-            output = torch.empty_like(a)
-            
-            grid = (triton.cdiv(tensor_size, block_size),)
-            
-            elementwise_divide_kernel[grid](
-                a_ptr=a,
-                b_ptr=b,
-                output_ptr=output,
-                n_elements=tensor_size,
-                BLOCK_SIZE=block_size
-            )
-
-            # Verification
-            expected_output = a / b
-            is_correct = torch.allclose(output, expected_output)
-            status = "PASSED" if is_correct else "FAILED"
-            print(status)
-
-        except Exception as e:
-            print(f"ERROR: {e}")
-
-    print("\n--- All variants tested. ---")
-    
-if __name__ == "__main__":
-    run()

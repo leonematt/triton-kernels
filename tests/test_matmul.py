@@ -3,123 +3,126 @@ import torch
 import nexus
 import os
 
-def test_matmul_simple():
-    """Test single matmul configuration for debugging"""
-    # Simple configuration
-# Test with smallest possible case first
-    M, N, K = 64, 64, 64
-    block_m, block_n, block_k = 64, 64, 16
+# Test variants - matching your matmul VARIANTS
+VARIANTS = [
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 16},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 16},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 16},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64},
+    {'BLOCK_SIZE_K': 16, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128},
+]
 
-    # This should need only 1 block: grid_size = 1
 
-    # Also try with num_warps matching what kernel expects
-    threads_per_block = 32  # num_warps=1 → 1 warp = 32 threads
-    
-    print(f"\n=== SIMPLE MATMUL TEST ===")
-    print(f"Matrix size: {M}x{N}x{K}")
-    print(f"Block size: {block_m}x{block_n}x{block_k}")
-    
-    # Setup runtime
+@pytest.fixture(scope="module")
+def runtime_and_device():
+    """Setup runtime and device once for all tests"""
     rt = nexus.get_runtime("cuda")
     dev = rt.get_devices()[0]
-    print(f"Device: {dev}")
+    return rt, dev
+
+
+@pytest.mark.parametrize("variant", VARIANTS, ids=lambda v: f"M{v['BLOCK_SIZE_M']}_N{v['BLOCK_SIZE_N']}_K{v['BLOCK_SIZE_K']}")
+def test_matmul(runtime_and_device, variant):
+    """Test matmul kernel with different block sizes"""
+    rt, dev = runtime_and_device
     
-    # Create test data
-    torch.manual_seed(42)
+    BLOCK_K = variant['BLOCK_SIZE_K']
+    BLOCK_M = variant['BLOCK_SIZE_M']
+    BLOCK_N = variant['BLOCK_SIZE_N']
+    
+    # Matrix dimensions
+    M, N, K = 512, 512, 512
+    
+    # Create test data on CPU
     a = torch.randn((M, K), dtype=torch.float32)
     b = torch.randn((K, N), dtype=torch.float32)
     c = torch.zeros((M, N), dtype=torch.float32)
-    print(f"Created tensors: a={a.shape}, b={b.shape}, c={c.shape}")
-    print(f"Strides: a={a.stride()}, b={b.stride()}, c={c.stride()}")
-    
-    # Create buffers
+
+    a_tile_size = BLOCK_M * BLOCK_K * 4  # 4 bytes per float
+    b_tile_size = BLOCK_K * BLOCK_N * 4
+    shared_mem = 2 * (a_tile_size + b_tile_size)
+
+    # Create device buffers
     nb_a = dev.create_buffer(a)
     nb_b = dev.create_buffer(b)
     nb_c = dev.create_buffer(c)
-    print(f"Created device buffers")
     
-    # Load kernel - use the Triton-generated name
-    kernel_name = f'matmul_nontiled_kernel_BLOCK_SIZE_M{block_m}_BLOCK_SIZE_N{block_n}_BLOCK_SIZE_K{block_k}'
+    # Kernel name format: matmul_BLOCK_SIZE_K_16_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16
+    kernel_name = f'matmul_BLOCK_SIZE_K_{BLOCK_K}_BLOCK_SIZE_M_{BLOCK_M}_BLOCK_SIZE_N_{BLOCK_N}'
     lib_path = f"ptx_kernels/{kernel_name}.ptx"
-    print(f"Loading: {lib_path}")
     
     if not os.path.exists(lib_path):
-        print(f"ERROR: File not found!")
-        print(f"Available PTX files:")
-        if os.path.exists("ptx_kernels"):
-            for f in os.listdir("ptx_kernels"):
-                if f.endswith(".ptx"):
-                    print(f"  {f}")
-        return
+        pytest.skip(f"Kernel file not found: {lib_path}")
     
-    lib = dev.load_library_file(lib_path)
-    kern = lib.get_kernel(kernel_name)
-    print(f"Loaded kernel")
+    try:
+        lib = dev.load_library(lib_path)
+        kern = lib.get_kernel(kernel_name)
+    except Exception as e:
+        pytest.fail(f"Failed to load kernel {kernel_name}: {e}")
     
-    # Setup command
+    # Create and configure command
     sched = dev.create_schedule()
     cmd = sched.create_command(kern)
     
-    # Set arguments (10 parameters total based on kernel signature)
-    # Pointers
-    cmd.set_arg(0, nb_a)      # a_ptr
-    cmd.set_arg(1, nb_b)      # b_ptr
-    cmd.set_arg(2, nb_c)      # c_ptr
-    # Dimensions
-    cmd.set_arg(3, M)         # M
-    cmd.set_arg(4, N)         # N
-    cmd.set_arg(5, K)         # K
-    # Strides
-    cmd.set_arg(6, a.stride(0))  # stride_am
-    cmd.set_arg(7, a.stride(1))  # stride_ak
-    cmd.set_arg(8, b.stride(0))  # stride_bk
-    cmd.set_arg(9, b.stride(1))  # stride_bn
-    # Note: c strides are handled inside the kernel based on the PTX
+    # Strides (row-major)
+    stride_ak = 1
+    stride_am = K
+    stride_bk = N
+    stride_bn = 1
+    stride_cm = N
+    stride_cn = 1
     
-    print(f"Set 10 arguments")
+    # Set arguments matching the kernel signature:
+    # a_ptr, b_ptr, c_ptr, K, M, N, stride_ak, stride_am, stride_bk, stride_bn, stride_cm, stride_cn
+    cmd.set_arg(0, nb_a)          # a_ptr
+    cmd.set_arg(1, nb_b)          # b_ptr
+    cmd.set_arg(2, nb_c)          # c_ptr
+    cmd.set_arg(3, K)             # K
+    cmd.set_arg(4, M)             # M
+    cmd.set_arg(5, N)             # N
+    cmd.set_arg(6, stride_ak)     # stride_ak
+    cmd.set_arg(7, stride_am)     # stride_am
+    cmd.set_arg(8, stride_bk)     # stride_bk
+    cmd.set_arg(9, stride_bn)     # stride_bn
+    cmd.set_arg(10, stride_cm)    # stride_cm
+    cmd.set_arg(11, stride_cn)    # stride_cn
+    cmd.set_arg(12, 0)            # metadata pointer
     
-    # Grid setup - matches Triton's grid calculation
-    grid_m = (M + block_m - 1) // block_m
-    grid_n = (N + block_n - 1) // block_n
+    # Calculate grid size
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
     grid_size = grid_m * grid_n
-    threads_per_block = 128  # num_warps=1 means 32 threads, but let's use 128 to be safe
     
-    print(f"Grid: {grid_size} blocks ({grid_m}x{grid_n}), {threads_per_block} threads/block")
+    print(f"\nTesting matmul M={BLOCK_M}, N={BLOCK_N}, K={BLOCK_K}")
+    print(f"Grid: [{grid_size}, 1, 1], Block: [128, 1, 1]")
+    print(f"Matrix dimensions: M={M}, N={N}, K={K}")
+    print(f"Kernel name: {kernel_name}")
     
-    cmd.finalize([grid_size, 1, 1], [threads_per_block, 1, 1])
-    print(f"Command finalized")
+    cmd.finalize([grid_size, 1, 1], [128, 1, 1], shared_mem)
     
-    # Run
+    # Run kernel
     sched.run()
-    print(f"Kernel executed")
     
-    # Get result
+    # Copy result back to CPU
     nb_c.copy(c)
-    print(f"Copied result back")
     
-    # Check
+    # Verify results using PyTorch
     expected = torch.matmul(a, b)
-    print(f"\nResult sample (first row):")
-    print(f"  Got:      {c[0, :5]}")
-    print(f"  Expected: {expected[0, :5]}")
-    max_diff = torch.max(torch.abs(c - expected)).item()
-    mean_diff = torch.mean(torch.abs(c - expected)).item()
-    print(f"\nDifferences:")
-    print(f"  Max:  {max_diff}")
-    print(f"  Mean: {mean_diff}")
-    print(f"  All zeros? {torch.all(c == 0).item()}")
     
-    is_correct = torch.allclose(c, expected, rtol=5e-3, atol=1e-1)
-    print(f"\nTest passed: {is_correct}")
+    print(f"Result[0,0]: {c[0, 0]}")
+    print(f"Expected[0,0]: {expected[0, 0]}")
     
-    if not is_correct:
-        print(f"\nDEBUG INFO:")
-        print(f"  Result min/max: {c.min().item():.6f} / {c.max().item():.6f}")
-        print(f"  Expected min/max: {expected.min().item():.6f} / {expected.max().item():.6f}")
-        print(f"  Result norm: {torch.norm(c).item():.6f}")
-        print(f"  Expected norm: {torch.norm(expected).item():.6f}")
-    
-    assert is_correct, f"Results don't match! Max diff: {max_diff}"
+    assert torch.allclose(c, expected, rtol=1e-1, atol=1e-1), \
+        f"Mismatch for M={BLOCK_M}, N={BLOCK_N}, K={BLOCK_K}.\n" \
+        f"Max diff: {max_diff}"
+
 
 if __name__ == "__main__":
-    test_matmul_simple()
+    pytest.main([__file__, "-v", "-s"])

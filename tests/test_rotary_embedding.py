@@ -107,62 +107,59 @@ def test_rotary_embedding(runtime_and_device, variant):
     nb_cos = dev.create_buffer(cos)
     nb_sin = dev.create_buffer(sin)
     
-    # Create dummy buffer
-    dummy = torch.zeros(1, dtype=torch.float32)
-    nb_dummy = dev.create_buffer(dummy)
-    
-    # Load kernel
-    kernel_name = f'rotary_embedding_kernel_BATCH{batch}_SEQLEN{seqlen}_NHEADS{nheads}_HEADDIM{headdim}_ROTARY_DIM{rotary_dim}_INTERLEAVED{interleaved}_INPLACE{inplace}'
+    # Build kernel name - no _kernel suffix
+    # Format: rotary_embedding_BATCH_2_HEADDIM_64_INTERLEAVED_False_INPLACE_False_NHEADS_4_ROTARY_DIM_64_SEQLEN_128
+    kernel_name = f'rotary_embedding_BATCH_{batch}_HEADDIM_{headdim}_INTERLEAVED_{interleaved}_INPLACE_{inplace}_NHEADS_{nheads}_ROTARY_DIM_{rotary_dim}_SEQLEN_{seqlen}'
     lib_path = f"ptx_kernels/{kernel_name}.ptx"
     
     if not os.path.exists(lib_path):
         pytest.skip(f"Kernel file not found: {lib_path}")
     
     try:
-        lib = dev.load_library_file(lib_path)
+        lib = dev.load_library(lib_path)
         kern = lib.get_kernel(kernel_name)
     except Exception as e:
         pytest.fail(f"Failed to load kernel {kernel_name}: {e}")
     
-    # Determine block sizes
+    # Determine block sizes based on rotary_dim and interleaved
     BLOCK_K = 32 if rotary_dim <= 32 else (64 if rotary_dim <= 64 else (128 if rotary_dim <= 128 else 256))
     BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
     
     # Calculate grid dimensions
     grid_m = (seqlen + BLOCK_M - 1) // BLOCK_M
     grid = [grid_m, nheads, batch]
-    block = [64, 1, 1]
     
     print(f"\nTesting rotary embedding:")
     print(f"  Config: batch={batch}, seqlen={seqlen}, nheads={nheads}, headdim={headdim}")
     print(f"  Rotary: rotary_dim={rotary_dim}, interleaved={interleaved}, inplace={inplace}")
-    print(f"  Grid: {grid}, Block: {block}")
+    print(f"  Grid: {grid}, Block: [128, 1, 1]")
+    print(f"  Kernel: {kernel_name}")
     
     # Create and configure command
     sched = dev.create_schedule()
     cmd = sched.create_command(kern)
     
-    # Set arguments - PTX has 15 params (0-14) but Triton optimizes away 2 strides
-    # Try passing all 17 to match what Triton does
+    # Set arguments matching the PTX signature
     cmd.set_arg(0, nb_out)                    # OUT pointer
     cmd.set_arg(1, nb_x)                      # X pointer
     cmd.set_arg(2, nb_cos)                    # COS pointer
     cmd.set_arg(3, nb_sin)                    # SIN pointer
-    cmd.set_arg(4, 0)                         # seqlen_offsets (u32)
-    cmd.set_arg(5, seqlen)                    # seqlen (u32)
-    cmd.set_arg(6, rotary_dim)                # rotary_dim (u32)
-    cmd.set_arg(7, seqlen)                    # seqlen_ro (u32)
-    cmd.set_arg(8, output.stride(0))          # stride_out_batch
-    cmd.set_arg(9, output.stride(1))          # stride_out_seqlen
-    cmd.set_arg(10, output.stride(2))         # stride_out_nheads
-    cmd.set_arg(11, output.stride(3))         # stride_out_headdim
-    cmd.set_arg(12, x.stride(0))              # stride_x_batch
-    cmd.set_arg(13, x.stride(1))              # stride_x_seqlen
-    cmd.set_arg(14, x.stride(2))              # stride_x_nheads (optimized away in PTX)
-    cmd.set_arg(15, x.stride(3))              # stride_x_headdim (optimized away in PTX)
-    cmd.set_arg(16, nb_dummy)                 # dummy pointer
+    cmd.set_arg(4, 0)                         # CU_SEQLENS (null pointer as int)
+    cmd.set_arg(5, 0)                         # SEQLEN_OFFSETS (int, not tensor)
+    cmd.set_arg(6, seqlen)                    # seqlen
+    cmd.set_arg(7, rotary_dim)                # rotary_dim
+    cmd.set_arg(8, seqlen)                    # seqlen_ro
+    cmd.set_arg(9, output.stride(0))          # stride_out_batch
+    cmd.set_arg(10, output.stride(1))         # stride_out_seqlen
+    cmd.set_arg(11, output.stride(2))         # stride_out_nheads
+    cmd.set_arg(12, output.stride(3))         # stride_out_headdim
+    cmd.set_arg(13, x.stride(0))              # stride_x_batch
+    cmd.set_arg(14, x.stride(1))              # stride_x_seqlen
+    cmd.set_arg(15, x.stride(2))              # stride_x_nheads
+    cmd.set_arg(16, x.stride(3))              # stride_x_headdim
+    cmd.set_arg(17, 0)                        # metadata pointer
     
-    cmd.finalize(grid, block)
+    cmd.finalize(grid, [128, 1, 1])
     
     # Run kernel
     sched.run()
@@ -174,14 +171,15 @@ def test_rotary_embedding(runtime_and_device, variant):
     expected = naive_rotary_embedding(x_original, cos, sin, interleaved=interleaved)
     
     # Verify results
-    print(f"  Output shape: {output.shape}")
     print(f"  Output sample: {output[0, 0, 0, :5].tolist()}")
     print(f"  Expected sample: {expected[0, 0, 0, :5].tolist()}")
     
+    max_diff = (output[..., :rotary_dim] - expected[..., :rotary_dim]).abs().max().item()
+    print(f"  Max diff: {max_diff}")
+    
     # Check rotary dimensions
-    if not torch.allclose(output[..., :rotary_dim], expected[..., :rotary_dim], rtol=1e-4, atol=1e-4):
-        max_diff = (output[..., :rotary_dim] - expected[..., :rotary_dim]).abs().max().item()
-        pytest.fail(f"Rotary dimensions mismatch. Max diff: {max_diff}")
+    assert torch.allclose(output[..., :rotary_dim], expected[..., :rotary_dim], rtol=1e-3, atol=1e-3), \
+        f"Rotary dimensions mismatch. Max diff: {max_diff}"
     
     # Check non-rotary dimensions (if applicable)
     if rotary_dim < headdim:

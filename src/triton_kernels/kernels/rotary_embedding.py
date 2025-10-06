@@ -9,7 +9,6 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Optional, Union
 
 
 @triton.jit
@@ -135,23 +134,8 @@ def rotary_embedding_kernel(
         tl.store(OUT, out, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim))
 
 
-def compute_rotary_cos_sin(seqlen: int, rotary_dim: int, base: float = 10000.0, device: str = 'cuda'):
-    """
-    Precompute cos and sin values for rotary embeddings.
-    """
-    assert rotary_dim % 2 == 0, "rotary_dim must be even"
-    
-    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim))
-    t = torch.arange(seqlen, device=device, dtype=inv_freq.dtype)
-    freqs = torch.outer(t, inv_freq)
-    cos = freqs.cos()
-    sin = freqs.sin()
-    
-    return cos, sin
-
-
-# Test variants with different configurations
-variants = [
+# Variants with different configurations
+VARIANTS = [
     {'BATCH': 2, 'SEQLEN': 128, 'NHEADS': 4, 'HEADDIM': 64, 'ROTARY_DIM': 64, 'INTERLEAVED': False, 'INPLACE': False},
     {'BATCH': 2, 'SEQLEN': 256, 'NHEADS': 8, 'HEADDIM': 64, 'ROTARY_DIM': 64, 'INTERLEAVED': False, 'INPLACE': False},
     {'BATCH': 4, 'SEQLEN': 512, 'NHEADS': 8, 'HEADDIM': 128, 'ROTARY_DIM': 128, 'INTERLEAVED': False, 'INPLACE': False},
@@ -159,72 +143,3 @@ variants = [
     {'BATCH': 1, 'SEQLEN': 1024, 'NHEADS': 16, 'HEADDIM': 64, 'ROTARY_DIM': 32, 'INTERLEAVED': False, 'INPLACE': False},
     {'BATCH': 2, 'SEQLEN': 128, 'NHEADS': 4, 'HEADDIM': 64, 'ROTARY_DIM': 64, 'INTERLEAVED': False, 'INPLACE': True},
 ]
-
-
-def run():
-    print("--- Running Rotary Embedding Kernel Variants ---\n")
-
-    for i, variant in enumerate(variants):
-        batch = variant['BATCH']
-        seqlen = variant['SEQLEN']
-        nheads = variant['NHEADS']
-        headdim = variant['HEADDIM']
-        rotary_dim = variant['ROTARY_DIM']
-        interleaved = variant['INTERLEAVED']
-        inplace = variant['INPLACE']
-        seqlen_offsets = 0
-        conjugate = False
-
-        print(f"Variant {i+1}: batch={batch}, seqlen={seqlen}, nheads={nheads}, "
-              f"headdim={headdim}, rotary_dim={rotary_dim}, interleaved={interleaved}, "
-              f"inplace={inplace}... ", end="")
-
-        try:
-            x = torch.randn(batch, seqlen, nheads, headdim, device='cuda', dtype=torch.float32)
-            x_original = x.clone()
-            
-            cos, sin = compute_rotary_cos_sin(seqlen, rotary_dim, device='cuda')
-            cos, sin = cos.contiguous(), sin.contiguous()
-            
-            output = x if inplace else torch.empty_like(x)
-            if rotary_dim < headdim and not inplace:
-                output[..., rotary_dim:].copy_(x[..., rotary_dim:])
-        
-            BLOCK_K = (32 if rotary_dim <= 32 else (64 if rotary_dim <= 64 else (128 if rotary_dim <= 128 else 256)))
-            BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
-            
-            grid = (triton.cdiv(seqlen, BLOCK_M), nheads, batch)
-            
-            with torch.cuda.device(x.device.index):
-                rotary_embedding_kernel[grid](
-                    output, x, cos, sin,
-                    None, seqlen_offsets,
-                    seqlen, rotary_dim, seqlen,
-                    output.stride(0), output.stride(-3), output.stride(-2), output.stride(-1),
-                    x.stride(0), x.stride(-3), x.stride(-2), x.stride(-1),
-                    BLOCK_K=BLOCK_K,
-                    IS_SEQLEN_OFFSETS_TENSOR=False,
-                    IS_VARLEN=False,
-                    INTERLEAVED=interleaved,
-                    CONJUGATE=conjugate,
-                    BLOCK_M=BLOCK_M,
-                    num_warps=2 if rotary_dim <= 64 else 4,
-                )
-            
-            assert output.shape == x_original.shape
-            assert not torch.isnan(output).any()
-            assert not torch.isinf(output).any()
-            
-            if rotary_dim < headdim:
-                assert torch.allclose(output[..., rotary_dim:], x_original[..., rotary_dim:])
-            
-            print("PASSED")
-
-        except Exception as e:
-            print(f"ERROR: {e}")
-
-    print("\n--- All variants tested. ---")
-
-
-if __name__ == "__main__":
-    run()
