@@ -11,7 +11,8 @@ TEST_FILES = [
     "test_layernorm.py",
     "test_activation.py",
     "test_softmax.py",
-    "test_rotary_embedding.py",  # Uncomment when ready
+    "test_rotary_embedding.py",
+    "test_flash_attention.py",
 ]
 
 def run_test_file(test_file):
